@@ -16,20 +16,23 @@ assert(
 )
 
 assert(
-  /onExited: \{\s*if \(!root\.wakeRerunRequested\) return\s*\n\s*root\.wakeRerunRequested = false\s*\n\s*wakeProcess\.running = true/.test(serviceQml),
-  'a queued wake reruns once the in-flight one finishes'
+  /if \(root\.keyboardBlanked\) kbdRestoreReapplyTimer\.restart\(\)\s*\n\s*root\.keyboardBlanked = false\s*\n\s*if \(!root\.wakeRerunRequested\) return\s*\n\s*root\.wakeRerunRequested = false\s*\n\s*wakeProcess\.running = true/.test(serviceQml),
+  'a queued wake reruns once the in-flight one finishes, and a run that restored schedules a follow-up reapply'
 )
 
-// Restoring on every unlock regardless overwrote whatever the user actually
-// had (e.g. set with a firmware-handled brightness key) with a stale value.
 assert(
-  /function beginLock\(\) \{[\s\S]*keyboardBlanked = false\s*\n\s*keyboardOffSaved = false/.test(serviceQml),
+  /if \(lockRequested\) armBlankTimer\(\)[\s\S]*if \(!wakeProcess\.running\) wakeProcess\.running = true/.test(serviceQml),
+  'the suspend-gap check in armBlankTimer runs before wakeProcess captures keyboardBlanked, not after'
+)
+
+assert(
+  /function beginLock\(\) \{[\s\S]*keyboardBlanked = false/.test(serviceQml),
   'each lock session starts assuming it never blanked the keyboard'
 )
 
 assert(
-  /function runBlank\(\) \{\s*(?:\/\/[^\n]*\n\s*)*keyboardBlanked = true\s*\n\s*keyboardOffSaved = true/.test(serviceQml),
-  'the real off is what makes brightnessctl\'s own restore trustworthy again'
+  /function runBlank\(\) \{\s*(?:\/\/[^\n]*\n\s*)*(?:root\.\w+ = \w+\s*\n\s*)*keyboardBlanked = true/.test(serviceQml),
+  'the real off marks the keyboard blanked'
 )
 
 assert(
@@ -37,27 +40,45 @@ assert(
   'a suspend detected via the frozen timer also counts as reason to restore, even though this session never ran the blank itself'
 )
 
+// armBlankTimer checks the same gap on every re-arm, not only when
+// idleBlankTimer's own onTriggered gets an uninterrupted turn to fire --
+// a resume replays a burst of wake nudges that keeps re-arming the timer
+// before its own deadline is ever reached, so onTriggered alone misses it.
 assert(
-  /if \(Date\.now\(\) - armedAt > interval \+ 2000\) \{[\s\S]{0,400}\bkeyboardOffSaved\b/.test(serviceQml) === false,
-  'the suspend-frozen guard never claims the real off ran, since it never did'
+  /function armBlankTimer\(\) \{[\s\S]*if \(idleBlankTimer\.armedAt > 0 && now - idleBlankTimer\.armedAt > idleBlankTimer\.interval \+ 2000\) \{\s*\n\s*root\.keyboardBlanked = true/.test(serviceQml),
+  'a suspend gap is also detected on every re-arm, not only on an actual timer firing'
 )
 
-// A software change (e.g. the default Fn-key bindings calling
-// omarchy-brightness-keyboard) never reaches the hardware-change watcher, so
-// once the real off has captured it, that saved state must win over the
-// poll-tracked value -- which the watcher never updated for a software change
-// in the first place.
+// Never sourced from brightnessctl's own `-s`/`-r` save-restore: that trusts
+// "whatever's current right before the off call" to be the real value, which
+// breaks the instant the EC dims the keyboard on its own faster than any
+// software off call can run.
 assert(
-  /root\.keyboardOffSaved\s*\n\s*\? "; omarchy-brightness-keyboard restore"/.test(serviceQml),
-  'a session that ran the real off restores through brightnessctl\'s own save, correct for both software- and hardware-driven changes'
+  /root\.keyboardBlanked && root\.kbdDeviceName && root\.savedKeyboardBrightness >= 0\s*\n\s*\? \("; brightnessctl -d '" \+ root\.kbdDeviceName \+ "' set " \+ root\.savedKeyboardBrightness\)/.test(serviceQml),
+  'restore always uses the independently-tracked value, never brightnessctl\'s own restore'
 )
 
-// Only reached when a suspend was detected without the blank timer ever
-// getting a turn: brightnessctl's saved state was never updated, so this is
-// the only thing that might still reflect what was showing beforehand.
 assert(
-  /: \(root\.savedKeyboardBrightness >= 0[\s\S]*brightnessctl -d '" \+ root\.kbdDeviceName \+ "' set " \+ root\.savedKeyboardBrightness/.test(serviceQml),
-  'the poll-tracked value is only ever used as a fallback, not the primary restore path'
+  /keyboardOffSaved/.test(serviceQml) === false,
+  'brightnessctl\'s own save/restore is not trusted at all -- there is no keyboardOffSaved branch left'
+)
+
+// A resume also triggers a USB re-enumeration on some hardware a couple of
+// seconds after the EC's own wake sequence, resetting the keyboard
+// independent of anything the initial restore just set; there is no
+// notification for that, so the only way to win against it is to reapply.
+assert(
+  /Timer \{\s*\n\s*id: kbdRestoreReapplyTimer\s*\n\s*interval: 3000/.test(serviceQml),
+  'a follow-up reapply is scheduled a few seconds after a restore, to win against a delayed hardware reset'
+)
+
+// Refreshed on a schedule that shares no trigger with locking or suspend, so
+// it stays correct regardless of how fast the hardware reacts -- a read done
+// reactively at lock time can lose the race against the EC's own near-instant
+// dim and poison the tracked value with the already-dimmed reading.
+assert(
+  /Timer \{\s*\n\s*id: kbdBrightnessSnapshotTimer\s*\n\s*interval: 5000\s*\n\s*repeat: true\s*\n\s*running: root\.kbdBrightnessPath !== "" && !root\.locked/.test(serviceQml),
+  'the tracked brightness is refreshed periodically while unlocked, never while locked'
 )
 
 // Without this, a session that never touches the brightness key would have

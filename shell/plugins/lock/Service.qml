@@ -20,15 +20,18 @@ Item {
   property bool pendingSessionLock: false
   property bool wakeRerunRequested: false
   property bool keyboardBlanked: false
-  // Only true once runBlank() itself actually ran the real "off": that
-  // captures whatever was current via brightnessctl's own save, correct
-  // regardless of whether a software or a hardware-driven change put it
-  // there. The poll-tracked value below only ever fills in for the one case
-  // that leaves this false while keyboardBlanked is still true: a suspend
-  // detected without the idle-blank timer ever having gotten a turn.
-  property bool keyboardOffSaved: false
   property string kbdDeviceName: ""
   property string kbdBrightnessPath: ""
+  // The single source of truth for what to restore the keyboard to. NOT
+  // sourced from brightnessctl's own `-s`/`-r` save-restore: that trusts
+  // "whatever's current right before the off call" to be the real value,
+  // which breaks the instant this EC dims the keyboard on its own (measured
+  // at under 2ms after a lock request -- long before any software off call
+  // could run) -- the off call then saves the already-dimmed value, the exact
+  // failure this property exists to avoid. Refreshed independently, on a
+  // schedule that shares no trigger with locking or suspend -- see
+  // kbdBrightnessSnapshotTimer -- so it stays correct regardless of how fast
+  // the hardware reacts.
   property int savedKeyboardBrightness: -1
   // Tied directly to lock state rather than toggled by hand: manual toggling
   // around individual wake/blank events kept getting this wrong whenever one
@@ -162,7 +165,14 @@ Item {
     resetAuthenticationState()
     lockRequested = true
     keyboardBlanked = false
-    keyboardOffSaved = false
+    // A read done reactively at lock time loses a real race on this hardware:
+    // the EC can zero the keyboard within ~2ms of the lock request itself
+    // (confirmed via direct measurement -- faster than a spawned `cat` process
+    // can return), so a "refresh right as locking starts" reads the
+    // already-zeroed value and POISONS savedKeyboardBrightness with it for the
+    // rest of the session. kbdBrightnessSnapshotTimer's periodic cadence,
+    // sampling at times unrelated to any lock/suspend trigger, is what
+    // actually stays correct -- see that timer for the rest of this reasoning.
     armBlankTimer()
     logEvent("lock-requested")
     queueSessionLock()
@@ -190,33 +200,44 @@ Item {
   }
 
   function armBlankTimer() {
-    idleBlankTimer.armedAt = Date.now()
+    // idleBlankTimer.onTriggered's own suspend check assumes the Timer gets a
+    // turn to fire and notice the gap -- measured false on resume: Hyprland
+    // replays a burst of a dozen-plus wake nudges within ~3s of waking, each
+    // one re-arming this timer from scratch before its 5s deadline is ever
+    // reached, so onTriggered never runs at all for the rest of that lock
+    // session. Checking the gap here too, on every re-arm rather than only on
+    // an actual firing, catches it regardless: the first re-arm in that burst
+    // still sees the full frozen-duration gap against the arm from before the
+    // suspend, even though the Timer object itself never got to react to it.
+    var now = Date.now()
+    if (idleBlankTimer.armedAt > 0 && now - idleBlankTimer.armedAt > idleBlankTimer.interval + 2000) {
+      root.keyboardBlanked = true
+    }
+    idleBlankTimer.armedAt = now
     idleBlankTimer.restart()
   }
 
   function runWake() {
     root.displaysBlank = false
     root.monitorDpmsKnown = false
+    // Must run before starting/queuing wakeProcess below, not after: this is
+    // what can detect a suspend gap and set keyboardBlanked true (see
+    // armBlankTimer), and wakeProcess's command captures keyboardBlanked at
+    // the moment it starts. Checking the gap after already starting the
+    // process would make the very first wake of a resume -- the one that
+    // actually discovers the gap -- run with the stale, pre-detection value.
+    if (lockRequested) armBlankTimer()
     // A wake already in flight (e.g. from a keystroke nudge) must not cause
     // this request to vanish: queue a rerun so the display/keyboard restore
     // this call exists for still lands once the in-flight run finishes.
     if (!wakeProcess.running) wakeProcess.running = true
     else wakeRerunRequested = true
-    if (lockRequested) armBlankTimer()
   }
 
   function runBlank() {
     root.displaysBlank = true
     root.monitorDpmsKnown = false
-    // This is the real off, via brightnessctl's own save -- correct regardless
-    // of whether a software or a hardware-driven change is what the keyboard
-    // was showing, so the restore path below can prefer it over the
-    // poll-tracked value once this has actually run. (Tracking itself was
-    // already frozen back in beginLock(), holding whatever the keyboard
-    // legitimately showed right before this lock session started, so nothing
-    // here needs to touch that.)
     keyboardBlanked = true
-    keyboardOffSaved = true
     if (!blankProcess.running) blankProcess.running = true
   }
 
@@ -479,24 +500,44 @@ Item {
     id: wakeProcess
     // Keyboard restore only makes sense if this lock session actually blanked
     // it: otherwise it overwrites the user's current brightness (e.g. set via
-    // a firmware-handled brightness key) with a stale value. When the real
-    // off ran (keyboardOffSaved), brightnessctl's own restore is correct --
-    // it saved whatever was actually current, software- or hardware-driven,
-    // at that moment. Otherwise a suspend was merely detected without the
-    // blank timer ever getting a turn, and the poll-tracked value is the
-    // only thing that might still reflect what was showing beforehand.
+    // a firmware-handled brightness key) with a stale value. Always restores
+    // through savedKeyboardBrightness, never through brightnessctl's own
+    // `-r restore` -- see that property's own comment for why its "-s save
+    // whatever's current" semantics aren't trustworthy on this hardware.
     command: ["bash", "-c",
       "omarchy-brightness-display on" +
-      (root.keyboardBlanked && root.kbdDeviceName
-        ? (root.keyboardOffSaved
-            ? "; omarchy-brightness-keyboard restore"
-            : (root.savedKeyboardBrightness >= 0
-                ? ("; brightnessctl -d '" + root.kbdDeviceName + "' set " + root.savedKeyboardBrightness)
-                : ""))
+      (root.keyboardBlanked && root.kbdDeviceName && root.savedKeyboardBrightness >= 0
+        ? ("; brightnessctl -d '" + root.kbdDeviceName + "' set " + root.savedKeyboardBrightness)
         : "") +
       "; omarchy-hyprland-monitor-clamshell >/dev/null 2>&1 || true"]
 
     onExited: {
+      // Consumed after the first run, not before it starts: a resume from
+      // suspend replays a burst of a dozen-plus wake nudges within a few
+      // seconds (measured), so this exists to run at most once per blank
+      // cycle. Clearing any earlier -- e.g. up front in runWake() -- would
+      // race a rerun still queued from *this* burst, which reads
+      // keyboardBlanked fresh at its own, later start time: a late nudge in
+      // the same burst could still restore, using whatever
+      // savedKeyboardBrightness has drifted to by then (a hardware
+      // notification queued during the suspend/resume boundary can arrive
+      // late, after this process already restored correctly, and report a
+      // stale pre-restore value). Clearing only once a run has actually
+      // completed closes that window: every rerun after the first sees
+      // keyboardBlanked already false and leaves the keyboard alone.
+      //
+      // A run that DID restore schedules one follow-up re-assertion: measured
+      // on this hardware, resume also triggers a genuine USB host-controller
+      // resume error (kernel log: "xHC error in resume, USBSTS 0x401,
+      // Reinit"), forcing a full re-enumeration a couple of seconds after the
+      // EC's own wake sequence and snapping the keyboard controller back to a
+      // hardware default independent of anything this restore just set.
+      // There is no notification for that -- it isn't a brightness_hw_changed
+      // event, just a later, unrelated reset -- so the only way to win
+      // against it is to re-assert the same value once more after it's had
+      // time to happen, rather than trying to detect it.
+      if (root.keyboardBlanked) kbdRestoreReapplyTimer.restart()
+      root.keyboardBlanked = false
       if (!root.wakeRerunRequested) return
       root.wakeRerunRequested = false
       wakeProcess.running = true
@@ -561,6 +602,43 @@ Item {
     }
   }
 
+  // Refreshes savedKeyboardBrightness from a direct read. Triggered both from
+  // beginLock() and, periodically, by kbdBrightnessSnapshotTimer below.
+  Process {
+    id: refreshKbdBrightnessProc
+    command: ["cat", root.kbdBrightnessPath]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var val = parseInt(String(text || "").trim())
+        if (!isNaN(val)) root.savedKeyboardBrightness = val
+      }
+    }
+  }
+
+  // A live brightness_hw_changed notification (kbdWatcherProc above) is the
+  // precise way to track a hardware-driven change, but it depends on the
+  // watcher process actually being scheduled at the moment the EC signals it
+  // -- confirmed unreliable here for the EC's own lid-close-triggered dim,
+  // which lands while the suspend freezer has already stopped every user
+  // process, watcher included, so the notification has nobody left to read
+  // it. A single fresh read at beginLock() has the same problem in miniature:
+  // when the same lid-close event fires both the lock and an almost-
+  // immediate suspend, the EC can zero the value before that read's own
+  // process finishes spawning. A periodic snapshot while unlocked sidesteps
+  // both races entirely -- it never depends on catching the exact instant of
+  // a hardware change, only on having asked recently enough that the answer
+  // is still true. 5s matches idleBlankTimer's own cadence and costs one cat
+  // process every 5s only while awake and unlocked, never while locked or
+  // suspended.
+  Timer {
+    id: kbdBrightnessSnapshotTimer
+    interval: 5000
+    repeat: true
+    running: root.kbdBrightnessPath !== "" && !root.locked
+    onTriggered: refreshKbdBrightnessProc.running = true
+  }
+
   // The keyboard backlight can change outside any script the shell calls: a
   // firmware-handled brightness key changes the sysfs value directly, and on
   // some hardware the EC zeroes it the instant the lid shuts, before this
@@ -607,6 +685,24 @@ Item {
     interval: 2000
     repeat: false
     onTriggered: kbdWatcherProc.running = true
+  }
+
+  // See wakeProcess.onExited for why this exists: re-asserts the same
+  // restore value once more, after the USB re-enumeration a resume triggers
+  // on this hardware has had time to reset the keyboard controller on its
+  // own.
+  Timer {
+    id: kbdRestoreReapplyTimer
+    interval: 3000
+    repeat: false
+    onTriggered: {
+      if (root.kbdDeviceName && root.savedKeyboardBrightness >= 0) reapplyKbdBrightnessProc.running = true
+    }
+  }
+
+  Process {
+    id: reapplyKbdBrightnessProc
+    command: ["brightnessctl", "-d", root.kbdDeviceName, "set", String(root.savedKeyboardBrightness)]
   }
 
   Timer {
