@@ -20,6 +20,14 @@ Item {
   property bool pendingSessionLock: false
   property bool wakeRerunRequested: false
   property bool keyboardBlanked: false
+  // Once a restore has actually run this lock session, the idle-blank timer
+  // stops dimming the keyboard again for the rest of it: without this, a
+  // pause of more than 5s anywhere between the lock screen becoming visible
+  // (whether from a fresh lock or a resume) and actually typing the password
+  // re-dims and then immediately re-lights the keyboard the moment typing
+  // resumes -- a real, user-visible flicker, not a bug in the restored value
+  // itself. Reset alongside keyboardBlanked at the start of each lock.
+  property bool keyboardRestoredOnce: false
   property string kbdDeviceName: ""
   property string kbdBrightnessPath: ""
   // The single source of truth for what to restore the keyboard to. NOT
@@ -165,6 +173,7 @@ Item {
     resetAuthenticationState()
     lockRequested = true
     keyboardBlanked = false
+    keyboardRestoredOnce = false
     // A read done reactively at lock time loses a real race on this hardware:
     // the EC can zero the keyboard within ~2ms of the lock request itself
     // (confirmed via direct measurement -- faster than a spawned `cat` process
@@ -197,6 +206,16 @@ Item {
     sessionLock.locked = false
     logEvent("unlocked")
     runWake()
+    // Independent of whatever runWake() just decided: the delayed hardware
+    // reset this exists to counter (see kbdRestoreReapplyTimer) has also been
+    // measured landing a second or so after the *unlock* transition itself,
+    // not only after a resume -- session teardown/refocus seems to be enough
+    // to trigger it on its own, with no correlation to whether this
+    // particular wake needed to restore anything. A defensive reapply here
+    // costs nothing when the keyboard was never touched by suspend at all
+    // (same value written twice), so it isn't worth trying to detect which
+    // case this is before scheduling it.
+    if (root.kbdDeviceName && root.savedKeyboardBrightness >= 0) kbdRestoreReapplyTimer.restart()
   }
 
   function armBlankTimer() {
@@ -536,7 +555,10 @@ Item {
       // event, just a later, unrelated reset -- so the only way to win
       // against it is to re-assert the same value once more after it's had
       // time to happen, rather than trying to detect it.
-      if (root.keyboardBlanked) kbdRestoreReapplyTimer.restart()
+      if (root.keyboardBlanked) {
+        kbdRestoreReapplyTimer.restart()
+        root.keyboardRestoredOnce = true
+      }
       root.keyboardBlanked = false
       if (!root.wakeRerunRequested) return
       root.wakeRerunRequested = false
@@ -728,7 +750,26 @@ Item {
       // Only a password check in flight should hold the display up. The
       // fingerprint PAM stays armed for the whole lock, so gating on
       // `authenticating` here would keep the panel lit until unlock.
-      if (root.lockRequested && !root.authenticatingPassword) root.runBlank()
+      // keyboardRestoredOnce also gates this: once a restore has actually run
+      // this session, a later idle gap here is just the user pausing before
+      // typing their password, not a reason to dim and immediately re-light
+      // the keyboard again -- that's a visible flicker, not a real off
+      // period, and it's the suspend-detected branch above (unguarded by
+      // design) that still needs to catch a genuine second suspend.
+      if (!root.lockRequested || root.authenticatingPassword) return
+      if (root.keyboardRestoredOnce) {
+        // Suppressed, not skipped outright: without re-arming here, armedAt
+        // is left at whatever it was 5s ago, so the *next* wake -- whenever
+        // that happens to be, seconds or minutes later -- sees a large gap
+        // against that stale value and misreads ordinary idle time as
+        // another suspend (measured: this exact sequence re-triggered the
+        // suspend-detected branch above on a plain pause, no suspend
+        // involved). Re-arming keeps the elapsed-time math honest for
+        // whichever branch runs next, while still never blanking again.
+        root.armBlankTimer()
+        return
+      }
+      root.runBlank()
     }
   }
 

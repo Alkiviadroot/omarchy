@@ -16,8 +16,8 @@ assert(
 )
 
 assert(
-  /if \(root\.keyboardBlanked\) kbdRestoreReapplyTimer\.restart\(\)\s*\n\s*root\.keyboardBlanked = false\s*\n\s*if \(!root\.wakeRerunRequested\) return\s*\n\s*root\.wakeRerunRequested = false\s*\n\s*wakeProcess\.running = true/.test(serviceQml),
-  'a queued wake reruns once the in-flight one finishes, and a run that restored schedules a follow-up reapply'
+  /if \(root\.keyboardBlanked\) \{\s*kbdRestoreReapplyTimer\.restart\(\)\s*\n\s*root\.keyboardRestoredOnce = true\s*\n\s*\}\s*\n\s*root\.keyboardBlanked = false\s*\n\s*if \(!root\.wakeRerunRequested\) return\s*\n\s*root\.wakeRerunRequested = false\s*\n\s*wakeProcess\.running = true/.test(serviceQml),
+  'a queued wake reruns once the in-flight one finishes, and only the run that actually restored marks the session done'
 )
 
 assert(
@@ -26,8 +26,8 @@ assert(
 )
 
 assert(
-  /function beginLock\(\) \{[\s\S]*keyboardBlanked = false/.test(serviceQml),
-  'each lock session starts assuming it never blanked the keyboard'
+  /function beginLock\(\) \{[\s\S]*keyboardBlanked = false\s*\n\s*keyboardRestoredOnce = false/.test(serviceQml),
+  'each lock session starts assuming it has neither blanked nor restored the keyboard yet'
 )
 
 assert(
@@ -63,6 +63,14 @@ assert(
   'brightnessctl\'s own save/restore is not trusted at all -- there is no keyboardOffSaved branch left'
 )
 
+// Without this, a pause of more than 5s between the lock screen becoming
+// visible and actually typing the password re-dims and then immediately
+// re-lights the keyboard again -- a visible flicker, not a real off period.
+assert(
+  /if \(root\.keyboardRestoredOnce\) \{[\s\S]*root\.armBlankTimer\(\)\s*\n\s*return\s*\n\s*\}\s*\n\s*root\.runBlank\(\)/.test(serviceQml),
+  'once a restore has run this session, a later idle gap re-arms the timer but never blanks again'
+)
+
 // A resume also triggers a USB re-enumeration on some hardware a couple of
 // seconds after the EC's own wake sequence, resetting the keyboard
 // independent of anything the initial restore just set; there is no
@@ -70,6 +78,11 @@ assert(
 assert(
   /Timer \{\s*\n\s*id: kbdRestoreReapplyTimer\s*\n\s*interval: 3000/.test(serviceQml),
   'a follow-up reapply is scheduled a few seconds after a restore, to win against a delayed hardware reset'
+)
+
+assert(
+  /function finishUnlock\(\) \{[\s\S]*runWake\(\)[\s\S]*kbdRestoreReapplyTimer\.restart\(\)/.test(serviceQml),
+  'the reapply is also scheduled independently at actual unlock, not only around a resume'
 )
 
 // Refreshed on a schedule that shares no trigger with locking or suspend, so
